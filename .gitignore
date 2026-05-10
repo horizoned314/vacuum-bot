@@ -3,4 +3,9 @@
 .vscode/c_cpp_properties.json
 .vscode/launch.json
 .vscode/ipch
+__pycache__
 .venv
+planning.txt
+prompt.txt
+.gitignore
+reference/
