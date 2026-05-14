@@ -1,0 +1,61 @@
+WIRING
+
+ESP32 DevKit V1
+
+* MPU6050 (I2C)
+VCC
+GND
+SCL D22
+SDA D21
+
+* 3x HC-SR04 (front, left, right)
+FRONT 
+VCC
+TRIG D19 
+ECHO D18
+GND
+
+LEFT 
+VCC
+TRIG D25
+ECHO D26
+GND
+
+RIGHT 
+VCC
+TRIG D27
+ECHO D33
+GND
+
+* 2x DC motors with simple optical speed encoder
+RIGHT
+VCC
+GND
+D0 D16
+A0 not used
+
+LEFT
+VCC
+GND
+D0 D17
+A0 not used
+
+* L298N motor driver (not yet connected)
+ENA D32
+IN1 D14
+IN2 D13
+IN3 D2
+IN4 D15
+ENB D4
+
+* SSD1306 OLED (I2C)
+GND
+VCC
+SCK same as SCL mpu6050
+SDA same as SDA mpu6050
+
+* Active buzzer
+VCC D23
+GND
+
+* 2x 18650 Li-ion SERIES + buck converter

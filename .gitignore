@@ -10,3 +10,4 @@ prompt.txt
 .gitignore
 reference/
 prompt-per-batch.txt
+prompt-with-wiring.txt
