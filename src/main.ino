@@ -1,693 +1,563 @@
-// ============================================================================
-// VacBot SLAM Navigator — ESP32 Main Firmware  (Batch 2)
-// ----------------------------------------------------------------------------
-// Target  : ESP32 DevKit V1 (Arduino-ESP32 core 2.0.14+ or 3.x)
-// Role    : Real-time sensing, odometry+IMU fusion, motor control,
-//           UDP telemetry/command, OLED status, buzzer alerts.
-//
-// LOCKED UDP CONTRACT (do not change):
-//   TX (ESP -> PC) : {"x":f,"y":f,"theta":f,"distances":[F,L,R],"timestamp":u}
-//   RX (PC -> ESP) : {"left_speed":i,"right_speed":i}
-//
-// Units  : meters, radians.  Angles wrapped to [-pi, pi].
-// Frame  : +x forward, +y left, +theta CCW (consistent w/ PC side).
-//
-// Library deps (install via Arduino Library Manager):
-//   - ArduinoJson  v6.x      (we use StaticJsonDocument — RX only)
-//   - Adafruit GFX
-//   - Adafruit SSD1306
-// Built-ins used: Wire, WiFi, WiFiUdp.
-// ============================================================================
+/*
+ * VacBot SLAM Navigator - ESP32 Main Firmware
+ *
+ * Responsibilities:
+ *   - Sensor acquisition (MPU6050 gyro Z, 3x HC-SR04 ultrasonic, 2x wheel encoders)
+ *   - Odometry + complementary IMU fusion (alpha = 0.98)
+ *   - Closed-loop motor command application with acceleration limiting
+ *   - UDP telemetry / command exchange with the PC SLAM stack
+ *
+ * Hard constraints (enforced):
+ *   - Fully non-blocking (only the 10 us HC-SR04 trigger pulse uses busy-wait,
+ *     as required by the sensor datasheet; nothing else blocks).
+ *   - millis() / micros() based scheduling.
+ *   - No dynamic allocation inside loop().
+ *   - Loop iteration < 20 ms (typically < 5 ms).
+ *
+ * Units: meters, radians. Angles always normalized to [-pi, pi].
+ * Body frame: x forward, y left, theta CCW positive.
+ *
+ * Required Arduino libraries:
+ *   - WiFi, WiFiUdp, Wire (built-in for ESP32 core)
+ *   - ArduinoJson v6.x  (Library Manager: "ArduinoJson" by Benoit Blanchon)
+ */
 
-#include <Arduino.h>
-#include <Wire.h>
 #include <WiFi.h>
 #include <WiFiUdp.h>
+#include <Wire.h>
 #include <ArduinoJson.h>
-#include <Adafruit_GFX.h>
-#include <Adafruit_SSD1306.h>
+#include <math.h>
 
-// ───────────── User configuration ─────────────────────────────────────────
-static const char*    WIFI_SSID = "YOUR_SSID";
-static const char*    WIFI_PASS = "YOUR_PASSWORD";
-static const IPAddress PC_IP(192, 168, 1, 100);   // PC listens here
-static const uint16_t  PC_PORT  = 9000;            // ESP32 -> PC telemetry
-static const uint16_t  ESP_PORT = 9001;            // PC -> ESP32 commands
+// =============================================================================
+// USER CONFIGURATION  (edit before flashing)
+// =============================================================================
+static const char*    WIFI_SSID     = "YOUR_WIFI_SSID";
+static const char*    WIFI_PASSWORD = "YOUR_WIFI_PASSWORD";
+static const char*    PC_IP         = "192.168.1.100"; // PC running the visualizer
+static const uint16_t PC_PORT       = 5005;            // PC listen port
+static const uint16_t LOCAL_PORT    = 5006;            // ESP32 listen port
 
-// ───────────── Pin map (locked by hardware spec) ──────────────────────────
-// I2C bus (MPU6050 + OLED share it)
-static const uint8_t I2C_SDA   = 21;
-static const uint8_t I2C_SCL   = 22;
+// =============================================================================
+// PIN MAP  (FIXED per spec - do not change)
+// =============================================================================
+static const uint8_t PIN_SDA = 21;
+static const uint8_t PIN_SCL = 22;
 
-// HC-SR04 — front, left, right
-static const uint8_t US_F_TRIG = 19, US_F_ECHO = 18;
-static const uint8_t US_L_TRIG = 25, US_L_ECHO = 26;
-static const uint8_t US_R_TRIG = 27, US_R_ECHO = 33;
+static const uint8_t PIN_TRIG_F = 19, PIN_ECHO_F = 18;
+static const uint8_t PIN_TRIG_L = 25, PIN_ECHO_L = 26;
+static const uint8_t PIN_TRIG_R = 27, PIN_ECHO_R = 33;
 
-// Encoders (single-channel)
-static const uint8_t ENC_R_PIN = 16;
-static const uint8_t ENC_L_PIN = 17;
+static const uint8_t PIN_ENC_R = 16;
+static const uint8_t PIN_ENC_L = 17;
 
-// L298N motor driver
-static const uint8_t MOT_ENA = 32;   // PWM left
-static const uint8_t MOT_IN1 = 14;
-static const uint8_t MOT_IN2 = 13;
-static const uint8_t MOT_IN3 = 2;
-static const uint8_t MOT_IN4 = 15;
-static const uint8_t MOT_ENB = 4;    // PWM right
+static const uint8_t PIN_ENA = 32, PIN_IN1 = 14, PIN_IN2 = 13;  // motor A -> RIGHT
+static const uint8_t PIN_IN3 = 2,  PIN_IN4 = 15, PIN_ENB = 4;   // motor B -> LEFT
 
-// Extras
-static const uint8_t BUZZER_PIN = 23;
+static const uint8_t PIN_BUZZER = 23;
 
-// OLED (SSD1306, 128x32 — chosen to keep redraw under 20 ms loop budget)
-static const uint8_t  OLED_W    = 128;
-static const uint8_t  OLED_H    = 32;
-static const uint8_t  OLED_ADDR = 0x3C;
+// =============================================================================
+// ROBOT PARAMETERS  (must match calibration.ino values)
+// =============================================================================
+static const float WHEEL_RADIUS      = 0.03f;   // meters
+static const float WHEEL_BASE        = 0.14f;   // meters
+static const int   TICKS_PER_REV     = 360;
+static const float COMP_ALPHA        = 0.98f;   // encoder weight in fusion
 
-// ───────────── Robot parameters (tune to your chassis) ────────────────────
-static const float WHEEL_RADIUS = 0.034f;                          // m
-static const float WHEEL_BASE   = 0.150f;                          // m
-static const int   ENCODER_CPR  = 20;                              // counts/rev
-static const float DIST_PER_CNT = (2.0f * PI * WHEEL_RADIUS) / (float)ENCODER_CPR;
+// Sensor mounting angles in body frame (radians)
+static const float SENSOR_ANGLE_F =  0.0f;
+static const float SENSOR_ANGLE_L =  1.5707963f;
+static const float SENSOR_ANGLE_R = -1.5707963f;
 
-// Complementary filter: encoder dominates short-term, IMU corrects drift.
-static const float ALPHA = 0.98f;
+// Distance filtering
+static const float DIST_MIN_M  = 0.02f;
+static const float DIST_MAX_M  = 2.5f;
+static const float DIST_JUMP_M = 0.5f;
 
-// ───────────── Timing periods (ms) ────────────────────────────────────────
-static const uint32_t T_IMU_MS   = 10;    // 100 Hz IMU
-static const uint32_t T_ODOM_MS  = 20;    //  50 Hz odometry
-static const uint32_t T_MOTOR_MS = 20;    //  50 Hz motor apply
-static const uint32_t T_TX_MS    = 50;    //  20 Hz UDP TX
-static const uint32_t T_OLED_MS  = 200;   //   5 Hz OLED
-static const uint32_t T_WIFI_MS  = 1000;  //   1 Hz reconnect check
+// PWM (ESP32 LEDC)
+static const int LEDC_CH_A      = 0;
+static const int LEDC_CH_B      = 1;
+static const int PWM_FREQ_HZ    = 20000;
+static const int PWM_RES_BITS   = 8;
+static const int PWM_DEADBAND   = 25;
+static const int ACCEL_STEP     = 15;   // PWM units / control tick
 
-// ───────────── Ultrasonic constants ───────────────────────────────────────
-static const float    US_MIN_M      = 0.02f;
-static const float    US_MAX_M      = 2.50f;
-static const float    US_JUMP_M     = 0.50f;
-static const uint32_t US_TRIG_US    = 10;
-static const uint32_t US_ECHO_TO_US = 25000;       // ~4.3 m round-trip
-static const uint32_t US_COOL_US    = 5000;        // gap between sensors
-static const uint32_t US_STALE_MS   = 500;
-static const float    US_DEFAULT_M  = US_MAX_M;    // "no obstacle" fallback
+// Scheduling (ms)
+static const uint32_t SENSOR_PERIOD_MS  = 50;   // 20 Hz odometry/fusion
+static const uint32_t CONTROL_PERIOD_MS = 20;   // 50 Hz control
+static const uint32_t COMM_PERIOD_MS    = 100;  // 10 Hz telemetry
+static const uint32_t UDP_TIMEOUT_MS    = 500;  // stop motors on link loss
+static const uint32_t US_SLOT_PERIOD_MS = 30;   // ultrasonic round-robin
+static const uint32_t STALL_TIMEOUT_MS  = 1200; // wheel stall detection
 
-// ───────────── Motor constants ────────────────────────────────────────────
-static const int PWM_MAX       = 255;
-static const int PWM_DEADBAND  = 25;    // below this -> 0 (overcome stiction)
-static const int PWM_RATE_STEP = 25;    // max |dPWM| per motor tick (=20 ms)
+// MPU6050 register map
+static const uint8_t MPU_ADDR    = 0x68;
+static const uint8_t MPU_PWR_MGMT = 0x6B;
+static const uint8_t MPU_GYRO_CFG = 0x1B;
+static const uint8_t MPU_ACC_CFG  = 0x1C;
+static const uint8_t MPU_GYRO_ZH  = 0x47;
 
-// ───────────── Safety ─────────────────────────────────────────────────────
-static const uint32_t CMD_TIMEOUT_MS = 500;
+// HC-SR04 echo timeout (us). 2.5 m max -> 14.5 ms round trip; 25 ms is safe.
+static const uint32_t US_TIMEOUT_US = 25000;
 
-// ───────────── Buzzer ─────────────────────────────────────────────────────
-static const uint16_t BUZZ_ON_MS  = 80;
-static const uint16_t BUZZ_GAP_MS = 80;
+// =============================================================================
+// STATE
+// =============================================================================
+struct Pose { float x; float y; float theta; };
+static Pose pose = {0.0f, 0.0f, 0.0f};
 
-// ───────────── MPU6050 ────────────────────────────────────────────────────
-static const uint8_t MPU_ADDR      = 0x68;
-static const float   GYRO_SENS_LSB = 131.0f;          // ±250°/s -> LSB per °/s
-static const float   DEG2RAD       = (float)PI / 180.0f;
+// Encoder counters (modified in ISR)
+static volatile long enc_left_count  = 0;
+static volatile long enc_right_count = 0;
+static int last_left_dir  = 0;  // sign of last commanded PWM, used by ISR
+static int last_right_dir = 0;
+static long prev_left_ticks  = 0;
+static long prev_right_ticks = 0;
 
-// ============================================================================
-// State variables
-// ============================================================================
-// Fused pose (single source of truth, world frame)
-float gX           = 0.0f;
-float gY           = 0.0f;
-float gTheta       = 0.0f;     // wrapped to [-pi, pi]
-float gThetaEnc    = 0.0f;     // wheel-only heading, wrapped
-float gThetaImu    = 0.0f;     // gyro-only heading, wrapped
-float gGyroZBias   = 0.0f;     // LSB
+// IMU
+static float gyro_z_offset = 0.0f;     // rad/s bias
+static float theta_imu     = 0.0f;     // pure IMU-integrated heading
+static uint32_t last_loc_us = 0;
 
-// Encoders — volatile because mutated in ISR
-volatile uint32_t encLeftCnt  = 0;
-volatile uint32_t encRightCnt = 0;
-uint32_t lastEncLeft  = 0;
-uint32_t lastEncRight = 0;
-int8_t   lastLeftDir  = 0;
-int8_t   lastRightDir = 0;
-
-// Ultrasonic — per-sensor state
-struct Sonar {
-  uint8_t  trigPin;
-  uint8_t  echoPin;
-  volatile uint32_t echoStartUs;
-  volatile uint32_t echoEndUs;
-  volatile bool     edgeStart;
-  volatile bool     edgeDone;
-  float    distance;
-  uint32_t lastGoodMs;
-  bool     hasGood;
+// Ultrasonic
+struct EchoSlot {
+  uint8_t  trig_pin;
+  uint8_t  echo_pin;
+  volatile uint32_t rise_us;
+  volatile uint32_t fall_us;
+  volatile bool     have_pulse;
+  float   last_valid;
+  bool    triggered;
+  uint32_t trig_time_us;
 };
-Sonar sonars[3] = {
-  { US_F_TRIG, US_F_ECHO, 0, 0, false, false, US_DEFAULT_M, 0, false },
-  { US_L_TRIG, US_L_ECHO, 0, 0, false, false, US_DEFAULT_M, 0, false },
-  { US_R_TRIG, US_R_ECHO, 0, 0, false, false, US_DEFAULT_M, 0, false },
+static EchoSlot us[3] = {
+  { PIN_TRIG_F, PIN_ECHO_F, 0, 0, false, -1.0f, false, 0 },
+  { PIN_TRIG_L, PIN_ECHO_L, 0, 0, false, -1.0f, false, 0 },
+  { PIN_TRIG_R, PIN_ECHO_R, 0, 0, false, -1.0f, false, 0 },
 };
-enum UsPhase { US_BEGIN, US_TRIG_HIGH, US_WAIT_ECHO, US_COOLDOWN };
-UsPhase  usPhase   = US_BEGIN;
-uint8_t  usIdx     = 0;
-uint32_t usPhaseUs = 0;
+static uint8_t us_active = 0;
+static float dist_out[3] = { -1.0f, -1.0f, -1.0f };  // F, L, R
 
-// Motor commands (current = ramped, target = requested)
-int targetLeftPwm   = 0;
-int targetRightPwm  = 0;
-int currentLeftPwm  = 0;
-int currentRightPwm = 0;
+// Motors
+static int cmd_left_target  = 0;
+static int cmd_right_target = 0;
+static int cmd_left_applied  = 0;
+static int cmd_right_applied = 0;
+static uint32_t last_tick_change_ms = 0;
 
-// Comms
-WiFiUDP udp;
-StaticJsonDocument<192> rxDoc;
-char txBuf[256];
-char rxBuf[192];
-uint32_t lastCmdMs      = 0;
-bool     everReceivedCmd = false;
-bool     timeoutBuzzed   = false;
+// Networking
+static WiFiUDP udp;
+static uint32_t last_rx_ms      = 0;
+static uint32_t last_tx_ms      = 0;
+static uint32_t last_wifi_check = 0;
 
-// OLED
-Adafruit_SSD1306 display(OLED_W, OLED_H, &Wire, -1);
-bool oledOk = false;
+// Scheduler
+static uint32_t last_sensor_ms  = 0;
+static uint32_t last_control_ms = 0;
+static uint32_t last_us_step_ms = 0;
 
-// Buzzer state machine
-uint32_t buzzOnUntilMs  = 0;
-uint32_t buzzNextOnAtMs = 0;
-uint8_t  buzzBeepsLeft  = 0;
-
-// Scheduler timestamps
-uint32_t tImu = 0, tOdom = 0, tMot = 0, tTx = 0, tOled = 0, tWifi = 0;
-
-// ============================================================================
-// Small helpers
-// ============================================================================
-static inline float wrapAngle(float a) {
-  while (a >  PI) a -= 2.0f * PI;
-  while (a < -PI) a += 2.0f * PI;
+// =============================================================================
+// UTILITIES
+// =============================================================================
+static inline float wrap_pi(float a) {
+  while (a >  M_PI) a -= 2.0f * (float)M_PI;
+  while (a < -M_PI) a += 2.0f * (float)M_PI;
   return a;
 }
-static inline int clampi(int v, int lo, int hi) {
-  return v < lo ? lo : (v > hi ? hi : v);
-}
-static inline int rateLimit(int target, int current, int step) {
-  int d = target - current;
-  if (d >  step) return current + step;
-  if (d < -step) return current - step;
-  return target;
+static inline int clamp_pwm(int v) {
+  if (v >  255) return  255;
+  if (v < -255) return -255;
+  return v;
 }
 
-// ============================================================================
-// ISRs
-// ============================================================================
-void IRAM_ATTR isrEncL() { encLeftCnt++;  }
-void IRAM_ATTR isrEncR() { encRightCnt++; }
-
-static inline void onEcho(uint8_t i, uint8_t pin) {
-  if (digitalRead(pin) == HIGH) {
-    sonars[i].echoStartUs = micros();
-    sonars[i].edgeStart   = true;
-  } else if (sonars[i].edgeStart) {
-    sonars[i].echoEndUs = micros();
-    sonars[i].edgeDone  = true;
-  }
+// =============================================================================
+// INTERRUPT HANDLERS
+// =============================================================================
+// Encoders are single-channel; direction is inferred from the last commanded
+// motor polarity (acceptable for a slow indoor robot).
+static void IRAM_ATTR isr_enc_left()  {
+  if (last_left_dir  >= 0) enc_left_count++;  else enc_left_count--;
 }
-void IRAM_ATTR isrEchoF() { onEcho(0, US_F_ECHO); }
-void IRAM_ATTR isrEchoL() { onEcho(1, US_L_ECHO); }
-void IRAM_ATTR isrEchoR() { onEcho(2, US_R_ECHO); }
+static void IRAM_ATTR isr_enc_right() {
+  if (last_right_dir >= 0) enc_right_count++; else enc_right_count--;
+}
 
-// ============================================================================
-// MPU6050 — raw I2C
-// ============================================================================
-static bool mpuWrite(uint8_t reg, uint8_t val) {
+// HC-SR04 echo edge ISRs - record rise and fall times to compute pulse width.
+static void IRAM_ATTR isr_echo_front() {
+  if (digitalRead(PIN_ECHO_F)) us[0].rise_us = micros();
+  else { us[0].fall_us = micros(); us[0].have_pulse = true; }
+}
+static void IRAM_ATTR isr_echo_left()  {
+  if (digitalRead(PIN_ECHO_L)) us[1].rise_us = micros();
+  else { us[1].fall_us = micros(); us[1].have_pulse = true; }
+}
+static void IRAM_ATTR isr_echo_right() {
+  if (digitalRead(PIN_ECHO_R)) us[2].rise_us = micros();
+  else { us[2].fall_us = micros(); us[2].have_pulse = true; }
+}
+
+// =============================================================================
+// MPU6050 (raw I2C, no external library)
+// =============================================================================
+static bool mpu_write_reg(uint8_t reg, uint8_t val) {
   Wire.beginTransmission(MPU_ADDR);
   Wire.write(reg);
   Wire.write(val);
   return Wire.endTransmission() == 0;
 }
-
-static bool mpuReadGyroZ(int16_t& raw) {
+static bool mpu_read_bytes(uint8_t reg, uint8_t* buf, uint8_t n) {
   Wire.beginTransmission(MPU_ADDR);
-  Wire.write(0x47);  // GYRO_ZOUT_H
+  Wire.write(reg);
   if (Wire.endTransmission(false) != 0) return false;
-  if (Wire.requestFrom((uint8_t)MPU_ADDR, (uint8_t)2) != 2) return false;
-  uint8_t hi = Wire.read();
-  uint8_t lo = Wire.read();
-  raw = (int16_t)((hi << 8) | lo);
+  uint8_t got = Wire.requestFrom((int)MPU_ADDR, (int)n);
+  if (got != n) return false;
+  for (uint8_t i = 0; i < n; i++) buf[i] = Wire.read();
   return true;
 }
-
-static void mpuInit() {
-  mpuWrite(0x6B, 0x00);   // wake (clear sleep)
-  mpuWrite(0x1A, 0x03);   // DLPF: ~44 Hz BW, 4.9 ms delay
-  mpuWrite(0x1B, 0x00);   // GYRO_FS_SEL = 0 (±250 dps -> 131 LSB/dps)
+static bool mpu_begin() {
+  if (!mpu_write_reg(MPU_PWR_MGMT, 0x00)) return false;  // wake
+  delay(50);
+  mpu_write_reg(MPU_GYRO_CFG, 0x00);   // +/- 250 deg/s, 131 LSB / (deg/s)
+  mpu_write_reg(MPU_ACC_CFG,  0x00);   // +/- 2 g
+  return true;
 }
-
-static void mpuCalibrate(uint16_t samples = 400) {
-  Serial.println(F("[IMU] Calibrating gyro Z bias — keep robot still..."));
-  long sum = 0;
+static bool mpu_read_gyro_z(float* gz_rad_s) {
+  uint8_t b[2];
+  if (!mpu_read_bytes(MPU_GYRO_ZH, b, 2)) return false;
+  int16_t raw = (int16_t)((b[0] << 8) | b[1]);
+  float gz_dps = (float)raw / 131.0f;
+  // Spec convention: CCW positive. If your board sees the opposite sign,
+  // flip here:  *gz_rad_s = -gz_dps * (M_PI / 180.0f);
+  *gz_rad_s = gz_dps * ((float)M_PI / 180.0f);
+  return true;
+}
+static void mpu_calibrate_gyro(uint16_t samples) {
+  double sum = 0.0;
   uint16_t got = 0;
   for (uint16_t i = 0; i < samples; i++) {
-    int16_t r;
-    if (mpuReadGyroZ(r)) { sum += r; got++; }
-    delay(3);   // setup only — not in loop()
+    float g;
+    if (mpu_read_gyro_z(&g)) { sum += g; got++; }
+    delay(3);
   }
-  gGyroZBias = (got > 0) ? ((float)sum / (float)got) : 0.0f;
-  Serial.print(F("[IMU] Bias LSB = "));
-  Serial.println(gGyroZBias, 3);
+  gyro_z_offset = (got > 0) ? (float)(sum / got) : 0.0f;
 }
 
-// ============================================================================
-// Ultrasonic — non-blocking round-robin state machine
-// ============================================================================
-static void usValidate(uint8_t i, float meters, uint32_t nowMs) {
-  if (meters < US_MIN_M || meters > US_MAX_M) return;          // OOR
-  if (sonars[i].hasGood &&
-      fabsf(meters - sonars[i].distance) > US_JUMP_M) return;  // jump
-  sonars[i].distance   = meters;
-  sonars[i].lastGoodMs = nowMs;
-  sonars[i].hasGood    = true;
+// =============================================================================
+// MOTOR DRIVER (L298N)
+// =============================================================================
+static void motor_init() {
+  pinMode(PIN_IN1, OUTPUT);
+  pinMode(PIN_IN2, OUTPUT);
+  pinMode(PIN_IN3, OUTPUT);
+  pinMode(PIN_IN4, OUTPUT);
+  ledcSetup(LEDC_CH_A, PWM_FREQ_HZ, PWM_RES_BITS);
+  ledcSetup(LEDC_CH_B, PWM_FREQ_HZ, PWM_RES_BITS);
+  ledcAttachPin(PIN_ENA, LEDC_CH_A);
+  ledcAttachPin(PIN_ENB, LEDC_CH_B);
+  digitalWrite(PIN_IN1, LOW); digitalWrite(PIN_IN2, LOW);
+  digitalWrite(PIN_IN3, LOW); digitalWrite(PIN_IN4, LOW);
+  ledcWrite(LEDC_CH_A, 0);
+  ledcWrite(LEDC_CH_B, 0);
+}
+static void apply_right_pwm(int p) {
+  p = clamp_pwm(p);
+  if (abs(p) < PWM_DEADBAND) p = 0;
+  if (p > 0)      last_right_dir =  1;
+  else if (p < 0) last_right_dir = -1;
+  if (p >= 0) {
+    digitalWrite(PIN_IN1, HIGH); digitalWrite(PIN_IN2, LOW);
+    ledcWrite(LEDC_CH_A, p);
+  } else {
+    digitalWrite(PIN_IN1, LOW);  digitalWrite(PIN_IN2, HIGH);
+    ledcWrite(LEDC_CH_A, -p);
+  }
+}
+static void apply_left_pwm(int p) {
+  p = clamp_pwm(p);
+  if (abs(p) < PWM_DEADBAND) p = 0;
+  if (p > 0)      last_left_dir =  1;
+  else if (p < 0) last_left_dir = -1;
+  if (p >= 0) {
+    digitalWrite(PIN_IN3, HIGH); digitalWrite(PIN_IN4, LOW);
+    ledcWrite(LEDC_CH_B, p);
+  } else {
+    digitalWrite(PIN_IN3, LOW);  digitalWrite(PIN_IN4, HIGH);
+    ledcWrite(LEDC_CH_B, -p);
+  }
+}
+static void motors_full_stop() {
+  cmd_left_target = cmd_right_target = 0;
+  cmd_left_applied = cmd_right_applied = 0;
+  apply_left_pwm(0);
+  apply_right_pwm(0);
 }
 
-static void usTick(uint32_t nowMs) {
-  const uint32_t nowUs = micros();
-  Sonar& s = sonars[usIdx];
-
-  switch (usPhase) {
-    case US_BEGIN: {
-      s.edgeStart = false;
-      s.edgeDone  = false;
-      digitalWrite(s.trigPin, LOW);
-      digitalWrite(s.trigPin, HIGH);
-      usPhaseUs = nowUs;
-      usPhase   = US_TRIG_HIGH;
-      break;
+// =============================================================================
+// ULTRASONIC NON-BLOCKING ROUND-ROBIN
+// =============================================================================
+static void us_trigger(EchoSlot& s) {
+  s.have_pulse  = false;
+  s.triggered   = true;
+  s.trig_time_us = micros();
+  digitalWrite(s.trig_pin, LOW);
+  delayMicroseconds(2);
+  digitalWrite(s.trig_pin, HIGH);
+  delayMicroseconds(10);            // 10 us trigger pulse required by HC-SR04
+  digitalWrite(s.trig_pin, LOW);
+}
+static void us_finish(EchoSlot& s, float& out) {
+  if (!s.triggered) return;
+  bool done = false;
+  if (s.have_pulse) {
+    uint32_t dt = s.fall_us - s.rise_us;
+    if (dt > 0 && dt < US_TIMEOUT_US) {
+      float d = (dt * 0.000343f) * 0.5f;      // speed of sound ~343 m/s
+      if (d >= DIST_MIN_M && d <= DIST_MAX_M) {
+        if (s.last_valid < 0.0f || fabsf(d - s.last_valid) < DIST_JUMP_M) {
+          s.last_valid = d;
+          out          = d;
+        }
+      }
     }
-    case US_TRIG_HIGH:
-      if ((nowUs - usPhaseUs) >= US_TRIG_US) {
-        digitalWrite(s.trigPin, LOW);
-        usPhaseUs = nowUs;
-        usPhase   = US_WAIT_ECHO;
-      }
-      break;
-    case US_WAIT_ECHO:
-      if (s.edgeDone) {
-        uint32_t dt = s.echoEndUs - s.echoStartUs;
-        float meters = (float)dt * 0.0001715f;   // 343 m/s / 2 / 1e6
-        usValidate(usIdx, meters, nowMs);
-        usPhaseUs = nowUs;
-        usPhase   = US_COOLDOWN;
-      } else if ((nowUs - usPhaseUs) >= US_ECHO_TO_US) {
-        usPhaseUs = nowUs;
-        usPhase   = US_COOLDOWN;
-      }
-      break;
-    case US_COOLDOWN:
-      if ((nowUs - usPhaseUs) >= US_COOL_US) {
-        usIdx   = (usIdx + 1) % 3;
-        usPhase = US_BEGIN;
-      }
-      break;
+    done = true;
+  } else if (micros() - s.trig_time_us > US_TIMEOUT_US) {
+    // No echo received in time -> out-of-range. Leave out as previous value
+    // but mark slot for retrigger; we do NOT poison the map with a bogus hit.
+    done = true;
   }
-
-  // Stale fallback — if no fresh good reading, publish safe default.
-  for (uint8_t k = 0; k < 3; k++) {
-    if (sonars[k].hasGood && (nowMs - sonars[k].lastGoodMs) > US_STALE_MS) {
-      sonars[k].distance = US_DEFAULT_M;
-      sonars[k].hasGood  = false;
-    }
-  }
+  if (done) s.triggered = false;
+}
+static void us_step(uint32_t now_ms) {
+  if (now_ms - last_us_step_ms < US_SLOT_PERIOD_MS) return;
+  last_us_step_ms = now_ms;
+  us_finish(us[us_active], dist_out[us_active]);
+  us_active = (us_active + 1) % 3;
+  us_trigger(us[us_active]);
 }
 
-// ============================================================================
-// IMU integration (100 Hz)
-// ============================================================================
-static void updateImu() {
-  static uint32_t lastUs = 0;
-  uint32_t nowUs = micros();
-  if (lastUs == 0) { lastUs = nowUs; return; }
-  float dt = (nowUs - lastUs) * 1e-6f;
-  lastUs = nowUs;
-  if (dt <= 0.0f || dt > 0.25f) return;   // sanity
-
-  int16_t raw;
-  if (!mpuReadGyroZ(raw)) return;
-  float dps = ((float)raw - gGyroZBias) / GYRO_SENS_LSB;   // deg/s
-  float rps = dps * DEG2RAD;                                // rad/s
-  gThetaImu = wrapAngle(gThetaImu + rps * dt);
-}
-
-// ============================================================================
-// Odometry + IMU fusion (50 Hz)
-// ============================================================================
-static void updateOdometry() {
-  // Atomic snapshot of encoder counts
+// =============================================================================
+// LOCALIZATION (odometry + complementary IMU fusion)
+// =============================================================================
+static void update_localization(float dt) {
+  // snapshot encoder counts
   noInterrupts();
-  uint32_t l = encLeftCnt;
-  uint32_t r = encRightCnt;
+  long el = enc_left_count;
+  long er = enc_right_count;
   interrupts();
 
-  uint32_t dlu = l - lastEncLeft;
-  uint32_t dru = r - lastEncRight;
-  lastEncLeft  = l;
-  lastEncRight = r;
+  long dl_ticks = el - prev_left_ticks;
+  long dr_ticks = er - prev_right_ticks;
+  prev_left_ticks  = el;
+  prev_right_ticks = er;
 
-  // Apply commanded direction (single-channel encoders give magnitude only)
-  float dsL = (float)dlu * DIST_PER_CNT * (float)lastLeftDir;
-  float dsR = (float)dru * DIST_PER_CNT * (float)lastRightDir;
+  // Stall watchdog
+  if (dl_ticks != 0 || dr_ticks != 0) last_tick_change_ms = millis();
 
-  float ds       = 0.5f * (dsL + dsR);
-  float dthetaEn = (dsR - dsL) / WHEEL_BASE;
+  const float circumference = 2.0f * (float)M_PI * WHEEL_RADIUS;
+  float dl = circumference * ((float)dl_ticks / (float)TICKS_PER_REV);
+  float dr = circumference * ((float)dr_ticks / (float)TICKS_PER_REV);
+  float ds       = 0.5f * (dl + dr);
+  float dtheta_e = (dr - dl) / WHEEL_BASE;
 
-  gThetaEnc = wrapAngle(gThetaEnc + dthetaEn);
-
-  // Complementary filter — wrap-safe (blend the *difference*, not raw angles)
-  // Equivalent to: theta = alpha*theta_enc + (1-alpha)*theta_imu, but correct
-  // across the ±pi discontinuity.
-  float diff  = wrapAngle(gThetaImu - gThetaEnc);
-  gTheta      = wrapAngle(gThetaEnc + (1.0f - ALPHA) * diff);
-
-  // Position integration uses the fused heading
-  gX += ds * cosf(gTheta);
-  gY += ds * sinf(gTheta);
-}
-
-// ============================================================================
-// Motors
-// ============================================================================
-static void writeMotor(uint8_t in1, uint8_t in2, uint8_t en, int pwm) {
-  if (pwm == 0) {
-    digitalWrite(in1, LOW);
-    digitalWrite(in2, LOW);
-    analogWrite(en, 0);
-  } else if (pwm > 0) {
-    digitalWrite(in1, HIGH);
-    digitalWrite(in2, LOW);
-    analogWrite(en, pwm);
-  } else {
-    digitalWrite(in1, LOW);
-    digitalWrite(in2, HIGH);
-    analogWrite(en, -pwm);
+  // IMU integration
+  float gz;
+  if (mpu_read_gyro_z(&gz)) {
+    gz -= gyro_z_offset;
+    // Clamp to physically plausible rate (saturation guard)
+    if (gz >  8.0f) gz =  8.0f;
+    if (gz < -8.0f) gz = -8.0f;
+    theta_imu = wrap_pi(theta_imu + gz * dt);
   }
+
+  // Complementary fusion on theta:
+  //   theta_new = alpha * (theta_old + dtheta_enc) + (1-alpha) * theta_imu
+  // Implemented as wrap-safe additive form.
+  float diff = wrap_pi(theta_imu - pose.theta);
+  pose.theta = wrap_pi(pose.theta + COMP_ALPHA * dtheta_e + (1.0f - COMP_ALPHA) * diff);
+
+  // World-frame translation (x forward, y left)
+  pose.x += ds * cosf(pose.theta);
+  pose.y += ds * sinf(pose.theta);
 }
 
-static void applyMotors() {
-  // Clamp targets
-  targetLeftPwm  = clampi(targetLeftPwm,  -PWM_MAX, PWM_MAX);
-  targetRightPwm = clampi(targetRightPwm, -PWM_MAX, PWM_MAX);
-
-  // Acceleration limiting (ramp toward target)
-  currentLeftPwm  = rateLimit(targetLeftPwm,  currentLeftPwm,  PWM_RATE_STEP);
-  currentRightPwm = rateLimit(targetRightPwm, currentRightPwm, PWM_RATE_STEP);
-
-  // Deadband — applied AFTER rate limiting so we still cross 0 cleanly
-  int outL = (abs(currentLeftPwm)  < PWM_DEADBAND) ? 0 : currentLeftPwm;
-  int outR = (abs(currentRightPwm) < PWM_DEADBAND) ? 0 : currentRightPwm;
-
-  // Track sign for encoder direction inference (preserve last when stopped)
-  if (outL > 0) lastLeftDir = 1;  else if (outL < 0) lastLeftDir = -1;
-  if (outR > 0) lastRightDir = 1; else if (outR < 0) lastRightDir = -1;
-
-  writeMotor(MOT_IN1, MOT_IN2, MOT_ENA, outL);
-  writeMotor(MOT_IN3, MOT_IN4, MOT_ENB, outR);
+// =============================================================================
+// CONTROL (acceleration-limited application of incoming PWM targets)
+// =============================================================================
+static void apply_acceleration_limit(int& applied, int target) {
+  if      (applied < target) applied = min(applied + ACCEL_STEP, target);
+  else if (applied > target) applied = max(applied - ACCEL_STEP, target);
+}
+static void update_control() {
+  apply_acceleration_limit(cmd_left_applied,  clamp_pwm(cmd_left_target));
+  apply_acceleration_limit(cmd_right_applied, clamp_pwm(cmd_right_target));
+  apply_left_pwm(cmd_left_applied);
+  apply_right_pwm(cmd_right_applied);
 }
 
-// ============================================================================
-// UDP — TX (telemetry) and RX (commands)
-// ============================================================================
-static void sendTelemetry(uint32_t now) {
-  // Deterministic, zero-allocation packing
-  int n = snprintf(
-    txBuf, sizeof(txBuf),
-    "{\"x\":%.4f,\"y\":%.4f,\"theta\":%.4f,"
-    "\"distances\":[%.3f,%.3f,%.3f],"
-    "\"timestamp\":%lu}",
-    gX, gY, gTheta,
-    sonars[0].distance, sonars[1].distance, sonars[2].distance,
-    (unsigned long)now
-  );
-  if (n <= 0 || n >= (int)sizeof(txBuf)) return;
+// =============================================================================
+// COMMUNICATION
+// =============================================================================
+static void send_telemetry() {
+  StaticJsonDocument<256> doc;
+  doc["x"]     = pose.x;
+  doc["y"]     = pose.y;
+  doc["theta"] = pose.theta;
+  JsonArray d  = doc.createNestedArray("distances");
+  d.add(dist_out[0]);
+  d.add(dist_out[1]);
+  d.add(dist_out[2]);
+  doc["timestamp"] = (uint32_t)millis();
+  char buf[256];
+  size_t n = serializeJson(doc, buf, sizeof(buf));
   udp.beginPacket(PC_IP, PC_PORT);
-  udp.write((const uint8_t*)txBuf, n);
+  udp.write((const uint8_t*)buf, n);
   udp.endPacket();
 }
-
-static void receiveCommands(uint32_t now) {
+static void poll_commands() {
   int sz = udp.parsePacket();
   if (sz <= 0) return;
-  if (sz >= (int)sizeof(rxBuf)) {
-    while (udp.available()) udp.read();
-    return;
-  }
-  int n = udp.read((uint8_t*)rxBuf, sizeof(rxBuf) - 1);
+  char buf[160];
+  int n = udp.read(buf, sizeof(buf) - 1);
   if (n <= 0) return;
-  rxBuf[n] = '\0';
-
-  rxDoc.clear();
-  DeserializationError err = deserializeJson(rxDoc, rxBuf, n);
-  if (err) return;
-
-  // Sentinel that won't be sent as a real PWM value
-  const int SENT = INT32_MIN;
-  int ls = rxDoc["left_speed"]  | SENT;
-  int rs = rxDoc["right_speed"] | SENT;
-  if (ls == SENT || rs == SENT) return;
-
-  targetLeftPwm  = clampi(ls, -PWM_MAX, PWM_MAX);
-  targetRightPwm = clampi(rs, -PWM_MAX, PWM_MAX);
-  lastCmdMs      = now;
-
-  if (!everReceivedCmd) {
-    everReceivedCmd = true;
-    buzzBeepsLeft   = 1;            // single beep on first ever command
-    buzzNextOnAtMs  = now;
-  }
-  timeoutBuzzed = false;            // re-arm timeout alert
+  buf[n] = '\0';
+  StaticJsonDocument<192> doc;
+  if (deserializeJson(doc, buf) != DeserializationError::Ok) return;
+  cmd_left_target  = clamp_pwm((int)(doc["left_speed"]  | 0));
+  cmd_right_target = clamp_pwm((int)(doc["right_speed"] | 0));
+  last_rx_ms = millis();
 }
-
-static void safetyWatchdog(uint32_t now) {
-  if (!everReceivedCmd) return;     // not armed until first command
-  if ((now - lastCmdMs) > CMD_TIMEOUT_MS) {
-    targetLeftPwm  = 0;
-    targetRightPwm = 0;
-    if (!timeoutBuzzed) {
-      buzzBeepsLeft  = 2;           // double beep on entering timeout state
-      buzzNextOnAtMs = now;
-      timeoutBuzzed  = true;
-    }
+static void wifi_ensure() {
+  uint32_t now = millis();
+  if (now - last_wifi_check < 1000) return;
+  last_wifi_check = now;
+  if (WiFi.status() != WL_CONNECTED) {
+    WiFi.disconnect();
+    WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
   }
 }
 
-// ============================================================================
-// Buzzer — non-blocking, queues N short beeps
-// ============================================================================
-static void updateBuzzer(uint32_t now) {
-  // Currently sounding -> turn off when on-window expires
-  if (buzzOnUntilMs != 0 && (int32_t)(now - buzzOnUntilMs) >= 0) {
-    digitalWrite(BUZZER_PIN, LOW);
-    buzzOnUntilMs = 0;
-    if (buzzBeepsLeft > 0) buzzNextOnAtMs = now + BUZZ_GAP_MS;
+// =============================================================================
+// SAFETY
+// =============================================================================
+static void safety_check() {
+  uint32_t now = millis();
+  // UDP timeout -> halt
+  if (now - last_rx_ms > UDP_TIMEOUT_MS) {
+    cmd_left_target  = 0;
+    cmd_right_target = 0;
   }
-  // Silent -> start next beep if any queued and gap elapsed
-  if (buzzBeepsLeft > 0 && buzzOnUntilMs == 0 &&
-      (int32_t)(now - buzzNextOnAtMs) >= 0) {
-    digitalWrite(BUZZER_PIN, HIGH);
-    buzzOnUntilMs = now + BUZZ_ON_MS;
-    buzzBeepsLeft--;
-  }
-}
-
-// ============================================================================
-// OLED — IP + pose + distances (5 Hz)
-// ============================================================================
-static void updateOled() {
-  if (!oledOk) return;
-  display.clearDisplay();
-  display.setTextSize(1);
-  display.setTextColor(SSD1306_WHITE);
-
-  // Line 0 — IP
-  display.setCursor(0, 0);
-  display.print(F("IP "));
-  if (WiFi.status() == WL_CONNECTED) display.print(WiFi.localIP());
-  else                                display.print(F("(no link)"));
-
-  // Line 1 — x, y
-  display.setCursor(0, 8);
-  display.print(F("x"));  display.print(gX, 2);
-  display.print(F(" y")); display.print(gY, 2);
-
-  // Line 2 — theta
-  display.setCursor(0, 16);
-  display.print(F("t"));  display.print(gTheta, 2);
-  display.print(F(" rad"));
-
-  // Line 3 — distances F L R
-  display.setCursor(0, 24);
-  display.print(F("d "));
-  display.print(sonars[0].distance, 2); display.print(' ');
-  display.print(sonars[1].distance, 2); display.print(' ');
-  display.print(sonars[2].distance, 2);
-
-  display.display();
-}
-
-// ============================================================================
-// WiFi
-// ============================================================================
-static void wifiBegin() {
-  WiFi.mode(WIFI_STA);
-  WiFi.setSleep(false);                   // keep latency low
-  WiFi.begin(WIFI_SSID, WIFI_PASS);
-  Serial.print(F("[WiFi] Connecting"));
-  uint32_t t0 = millis();
-  while (WiFi.status() != WL_CONNECTED && (millis() - t0) < 15000) {
-    delay(250);                           // setup-time only
-    Serial.print('.');
-  }
-  Serial.println();
-  if (WiFi.status() == WL_CONNECTED) {
-    Serial.print(F("[WiFi] IP: ")); Serial.println(WiFi.localIP());
-    udp.begin(ESP_PORT);
+  // Encoder stall -> halt (only when actively commanded)
+  if ((abs(cmd_left_applied) > PWM_DEADBAND || abs(cmd_right_applied) > PWM_DEADBAND)
+      && (now - last_tick_change_ms > STALL_TIMEOUT_MS)) {
+    cmd_left_target = 0; cmd_right_target = 0;
+    digitalWrite(PIN_BUZZER, HIGH);
   } else {
-    Serial.println(F("[WiFi] Connect failed — will keep retrying."));
+    digitalWrite(PIN_BUZZER, LOW);
   }
 }
 
-static void wifiCheck(uint32_t now) {
-  static bool wasConnected = false;
-  static uint32_t lastTry  = 0;
-
-  if (WiFi.status() == WL_CONNECTED) {
-    if (!wasConnected) {
-      udp.stop();
-      udp.begin(ESP_PORT);
-      Serial.print(F("[WiFi] reconnected, IP: "));
-      Serial.println(WiFi.localIP());
-    }
-    wasConnected = true;
-    return;
-  }
-  wasConnected = false;
-  if (now - lastTry < 5000) return;
-  lastTry = now;
-  WiFi.disconnect();
-  WiFi.begin(WIFI_SSID, WIFI_PASS);
-}
-
-// ============================================================================
-// SETUP
-// ============================================================================
+// =============================================================================
+// SETUP / LOOP
+// =============================================================================
 void setup() {
   Serial.begin(115200);
-  delay(50);
-  Serial.println(F("\n=== VacBot SLAM Navigator — ESP32 boot ==="));
+  delay(100);
 
-  // ---- Motors ----
-  pinMode(MOT_IN1, OUTPUT); pinMode(MOT_IN2, OUTPUT);
-  pinMode(MOT_IN3, OUTPUT); pinMode(MOT_IN4, OUTPUT);
-  pinMode(MOT_ENA, OUTPUT); pinMode(MOT_ENB, OUTPUT);
-  writeMotor(MOT_IN1, MOT_IN2, MOT_ENA, 0);
-  writeMotor(MOT_IN3, MOT_IN4, MOT_ENB, 0);
-  // Optional: lift PWM above audible range to avoid motor whine
-  // analogWriteFrequency(MOT_ENA, 20000);
-  // analogWriteFrequency(MOT_ENB, 20000);
-
-  // ---- Ultrasonics ----
-  for (uint8_t i = 0; i < 3; i++) {
-    pinMode(sonars[i].trigPin, OUTPUT);
-    digitalWrite(sonars[i].trigPin, LOW);
-    pinMode(sonars[i].echoPin, INPUT);
-  }
-  attachInterrupt(digitalPinToInterrupt(US_F_ECHO), isrEchoF, CHANGE);
-  attachInterrupt(digitalPinToInterrupt(US_L_ECHO), isrEchoL, CHANGE);
-  attachInterrupt(digitalPinToInterrupt(US_R_ECHO), isrEchoR, CHANGE);
-
-  // ---- Encoders ----
-  pinMode(ENC_L_PIN, INPUT_PULLUP);
-  pinMode(ENC_R_PIN, INPUT_PULLUP);
-  attachInterrupt(digitalPinToInterrupt(ENC_L_PIN), isrEncL, RISING);
-  attachInterrupt(digitalPinToInterrupt(ENC_R_PIN), isrEncR, RISING);
-
-  // ---- Buzzer ----
-  pinMode(BUZZER_PIN, OUTPUT);
-  digitalWrite(BUZZER_PIN, LOW);
-
-  // ---- I2C (MPU6050 + OLED share the bus) ----
-  Wire.begin(I2C_SDA, I2C_SCL);
+  // I2C
+  Wire.begin(PIN_SDA, PIN_SCL);
   Wire.setClock(400000);
 
-  // ---- OLED ----
-  if (display.begin(SSD1306_SWITCHCAPVCC, OLED_ADDR)) {
-    oledOk = true;
-    display.clearDisplay();
-    display.setTextSize(1);
-    display.setTextColor(SSD1306_WHITE);
-    display.setCursor(0, 0);
-    display.println(F("VacBot booting..."));
-    display.display();
+  // Ultrasonic pins
+  pinMode(PIN_TRIG_F, OUTPUT); pinMode(PIN_ECHO_F, INPUT);
+  pinMode(PIN_TRIG_L, OUTPUT); pinMode(PIN_ECHO_L, INPUT);
+  pinMode(PIN_TRIG_R, OUTPUT); pinMode(PIN_ECHO_R, INPUT);
+  digitalWrite(PIN_TRIG_F, LOW);
+  digitalWrite(PIN_TRIG_L, LOW);
+  digitalWrite(PIN_TRIG_R, LOW);
+  attachInterrupt(digitalPinToInterrupt(PIN_ECHO_F), isr_echo_front, CHANGE);
+  attachInterrupt(digitalPinToInterrupt(PIN_ECHO_L), isr_echo_left,  CHANGE);
+  attachInterrupt(digitalPinToInterrupt(PIN_ECHO_R), isr_echo_right, CHANGE);
+
+  // Encoders
+  pinMode(PIN_ENC_L, INPUT_PULLUP);
+  pinMode(PIN_ENC_R, INPUT_PULLUP);
+  attachInterrupt(digitalPinToInterrupt(PIN_ENC_L), isr_enc_left,  RISING);
+  attachInterrupt(digitalPinToInterrupt(PIN_ENC_R), isr_enc_right, RISING);
+
+  // Buzzer
+  pinMode(PIN_BUZZER, OUTPUT);
+  digitalWrite(PIN_BUZZER, LOW);
+
+  // Motors
+  motor_init();
+
+  // IMU
+  if (mpu_begin()) {
+    Serial.println(F("[INIT] MPU6050 OK. Calibrating gyro (~0.6 s)... hold still."));
+    mpu_calibrate_gyro(200);
+    Serial.print(F("[INIT] gyro_z_offset (rad/s) = "));
+    Serial.println(gyro_z_offset, 6);
   } else {
-    Serial.println(F("[OLED] not found at 0x3C — continuing without."));
+    Serial.println(F("[WARN] MPU6050 init failed; continuing on encoder-only odometry."));
   }
 
-  // ---- IMU ----
-  mpuInit();
-  delay(50);
-  mpuCalibrate();
+  // WiFi
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  uint32_t t0 = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - t0 < 8000) delay(50);
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.print(F("[INIT] WiFi connected. IP = "));
+    Serial.println(WiFi.localIP());
+  } else {
+    Serial.println(F("[WARN] WiFi not yet connected; will keep retrying."));
+  }
+  udp.begin(LOCAL_PORT);
 
-  // ---- WiFi + UDP ----
-  wifiBegin();
+  // Start ultrasonic chain
+  us_trigger(us[us_active]);
 
-  // ---- Scheduler ----
+  // Init schedulers
   uint32_t now = millis();
-  tImu = tOdom = tMot = tTx = tOled = tWifi = now;
-  lastCmdMs = now;   // does NOT arm the watchdog (see safetyWatchdog)
-
-  Serial.println(F("[SYS] Ready."));
+  last_loc_us         = micros();
+  last_sensor_ms      = now;
+  last_control_ms     = now;
+  last_tx_ms          = now;
+  last_us_step_ms     = now;
+  last_wifi_check     = now;
+  last_rx_ms          = now;          // give a grace period at boot
+  last_tick_change_ms = now;
 }
 
-// ============================================================================
-// LOOP — cooperative, millis-based, target <20 ms per iteration
-// ============================================================================
 void loop() {
-  const uint32_t now = millis();
+  uint32_t now = millis();
 
-  // Per-iteration (cheap)
-  usTick(now);
-  receiveCommands(now);
-  safetyWatchdog(now);
-  updateBuzzer(now);
+  // Network housekeeping (cheap; called every loop)
+  wifi_ensure();
+  poll_commands();
 
-  // 100 Hz IMU
-  if ((now - tImu) >= T_IMU_MS) {
-    tImu = now;
-    updateImu();
+  // Ultrasonic round-robin advance
+  us_step(now);
+
+  // 20 Hz: localization update
+  if (now - last_sensor_ms >= SENSOR_PERIOD_MS) {
+    last_sensor_ms = now;
+    uint32_t now_us = micros();
+    float dt = (now_us - last_loc_us) * 1e-6f;
+    last_loc_us = now_us;
+    if (dt <= 0.0f || dt > 0.2f) dt = 0.05f;
+    update_localization(dt);
   }
 
-  // 50 Hz odometry + fusion
-  if ((now - tOdom) >= T_ODOM_MS) {
-    tOdom = now;
-    updateOdometry();
+  // 50 Hz: safety + motor command application
+  if (now - last_control_ms >= CONTROL_PERIOD_MS) {
+    last_control_ms = now;
+    safety_check();
+    update_control();
   }
 
-  // 50 Hz motor apply (rate limit + PWM)
-  if ((now - tMot) >= T_MOTOR_MS) {
-    tMot = now;
-    applyMotors();
-  }
-
-  // 20 Hz UDP telemetry
-  if ((now - tTx) >= T_TX_MS) {
-    tTx = now;
-    if (WiFi.status() == WL_CONNECTED) sendTelemetry(now);
-  }
-
-  // 5 Hz OLED
-  if ((now - tOled) >= T_OLED_MS) {
-    tOled = now;
-    updateOled();
-  }
-
-  // 1 Hz WiFi keep-alive
-  if ((now - tWifi) >= T_WIFI_MS) {
-    tWifi = now;
-    wifiCheck(now);
+  // 10 Hz: telemetry to PC
+  if (now - last_tx_ms >= COMM_PERIOD_MS) {
+    last_tx_ms = now;
+    if (WiFi.status() == WL_CONNECTED) send_telemetry();
   }
 }
