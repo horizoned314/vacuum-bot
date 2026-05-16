@@ -7,6 +7,15 @@ Display conventions (chosen for natural reading of the map):
 
 So when the robot is at the origin facing +x, the heading arrow points up
 and its left-side ultrasonic ray points to the left of the screen.
+
+Controls:
+    Mouse left-click on map : set navigation goal
+    W / A / S / D           : manual drive override
+    T                       : toggle autonomous frontier exploration
+    R                       : reset map
+    O                       : save map
+    L                       : load map
+    ESC                     : quit
 """
 
 from __future__ import annotations
@@ -30,8 +39,11 @@ COLOR_RAY_HIT   = (255,  80,  80)
 COLOR_RAY_MISS  = (110, 110, 110)
 COLOR_PATH      = ( 40, 240, 120)
 COLOR_GOAL      = (255,  60, 200)
+COLOR_FRONTIER  = ( 90, 180, 255)
 COLOR_TEXT      = (235, 235, 235)
 COLOR_WARN      = (255, 200,   0)
+COLOR_AUTO_ON   = ( 80, 250, 130)
+COLOR_AUTO_OFF  = (180, 180, 180)
 
 
 class Visualizer:
@@ -46,6 +58,7 @@ class Visualizer:
         self.font_s = pygame.font.SysFont("Consolas", 14)
         self.font_m = pygame.font.SysFont("Consolas", 17)
         self._panel_lines_extra: List[str] = []
+        self._auto_explore_on = False
 
     # ===================== coordinate transforms =====================
     # Cell (gx, gy) -> screen pixel (center of cell).
@@ -76,6 +89,7 @@ class Visualizer:
             "load_map": False,
             "click_world": None,
             "manual": (0, 0),
+            "auto_toggle": False,
         }
         for ev in events:
             if ev.type == pygame.QUIT:
@@ -85,6 +99,7 @@ class Visualizer:
                 elif ev.key == pygame.K_r:      state["reset"] = True
                 elif ev.key == pygame.K_o:      state["save_map"] = True   # 'o' for sa(o)ve to avoid conflict with WASD
                 elif ev.key == pygame.K_l:      state["load_map"] = True
+                elif ev.key == pygame.K_t:      state["auto_toggle"] = True
                 elif ev.key == pygame.K_F5:     state["save_map"] = True   # backup binding
             elif ev.type == pygame.MOUSEBUTTONDOWN and ev.button == 1:
                 if ev.pos[0] < self.map_px:
@@ -104,6 +119,9 @@ class Visualizer:
 
     def set_status_lines(self, lines: List[str]) -> None:
         self._panel_lines_extra = list(lines)
+
+    def set_auto_explore(self, on: bool) -> None:
+        self._auto_explore_on = bool(on)
 
     # ===================== drawing =====================
     def _draw_grid(self) -> None:
@@ -158,13 +176,15 @@ class Visualizer:
         pygame.draw.lines(self.screen, COLOR_PATH, False, pts, 2)
 
     def _draw_goal(self,
-                   goal_world: Optional[Tuple[float, float]]) -> None:
+                   goal_world: Optional[Tuple[float, float]],
+                   auto_pick: bool = False) -> None:
         if goal_world is None:
             return
         sx, sy = self._world_to_px(*goal_world)
-        pygame.draw.circle(self.screen, COLOR_GOAL, (sx, sy), 7, 2)
-        pygame.draw.line(self.screen, COLOR_GOAL, (sx - 9, sy), (sx + 9, sy), 1)
-        pygame.draw.line(self.screen, COLOR_GOAL, (sx, sy - 9), (sx, sy + 9), 1)
+        color = COLOR_FRONTIER if auto_pick else COLOR_GOAL
+        pygame.draw.circle(self.screen, color, (sx, sy), 7, 2)
+        pygame.draw.line(self.screen, color, (sx - 9, sy), (sx + 9, sy), 1)
+        pygame.draw.line(self.screen, color, (sx, sy - 9), (sx, sy + 9), 1)
 
     def _draw_panel(self,
                     pose: Optional[Tuple[float, float, float]],
@@ -175,6 +195,12 @@ class Visualizer:
                          pygame.Rect(self.map_px, 0, PANEL_W, self.H))
         title = self.font_m.render("VacBot SLAM", True, COLOR_TEXT)
         self.screen.blit(title, (x0, y)); y += 28
+
+        # Auto-explore badge
+        auto_color = COLOR_AUTO_ON if self._auto_explore_on else COLOR_AUTO_OFF
+        auto_label = "AUTO  ON " if self._auto_explore_on else "AUTO  off"
+        self.screen.blit(self.font_m.render(auto_label, True, auto_color),
+                         (x0, y)); y += 26
 
         if pose is None:
             self.screen.blit(self.font_s.render("No telemetry", True, COLOR_WARN),
@@ -205,6 +231,7 @@ class Visualizer:
             "----- controls -----",
             " mouse: set goal",
             " WASD : manual drive",
+            " T    : toggle AUTO",
             " R    : reset map",
             " O    : save map",
             " L    : load map",
@@ -220,11 +247,12 @@ class Visualizer:
              distances: Optional[Sequence[float]],
              sensor_angles: Sequence[float],
              path: Optional[List[Tuple[int, int]]],
-             goal_world: Optional[Tuple[float, float]]) -> None:
+             goal_world: Optional[Tuple[float, float]],
+             goal_is_frontier: bool = False) -> None:
         self.screen.fill(BG_COLOR)
         self._draw_grid()
         self._draw_path(path)
-        self._draw_goal(goal_world)
+        self._draw_goal(goal_world, auto_pick=goal_is_frontier)
         if pose is not None and distances is not None:
             self._draw_rays(pose, distances, sensor_angles)
             self._draw_robot(pose)
