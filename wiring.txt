@@ -1,14 +1,14 @@
 WIRING
 
-ESP32 DevKit V1
+DOIT ESP32 DevKit V1 IMPORTANT WITH esp32 v3.3.8 board
 
-* MPU6050 (I2C)
+* MPU6050 (I2C) (make autocalibration too, really high noise)
 VCC
 GND
 SCL D22
 SDA D21
 
-* 3x HC-SR04 (front, left, right)
+* 3x HC-SR04 (front, left, right) (fine i think)
 FRONT 
 VCC
 TRIG D19 
@@ -27,20 +27,20 @@ TRIG D27
 ECHO D33
 GND
 
-* 2x DC motors with simple optical speed encoder
+* 2x DC motors with simple optical speed encoder (make auto calibration, because right and left never the same)
 RIGHT
 VCC
 GND
-D0 D16
+D0 D34
 A0 not used
 
 LEFT
 VCC
 GND
-D0 D17
+D0 D35
 A0 not used
 
-* L298N motor driver (not yet connected)
+* L298N motor driver (kebalik, jadi in3 low dan in4 high aja)
 ENA D32
 IN1 D14
 IN2 D13
@@ -48,7 +48,7 @@ IN3 D2
 IN4 D15
 ENB D4
 
-* SSD1306 OLED (I2C)
+* SSD1306 OLED (I2C) (128x32)
 GND
 VCC
 SCK same as SCL mpu6050
