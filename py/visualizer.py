@@ -1,18 +1,27 @@
 """
 visualizer.py - Pygame real-time visualization for the VacBot SLAM Navigator.
 
-Display conventions (chosen for natural reading of the map):
+Display conventions:
     +x world (robot forward)  ->  screen UP
     +y world (robot left)     ->  screen LEFT
 
-So when the robot is at the origin facing +x, the heading arrow points up
-and its left-side ultrasonic ray points to the left of the screen.
+Cell colors:
+    grey         unknown
+    white        free (not yet visited by robot footprint)
+    mint         free AND visited (cleaned)
+    black        occupied
+
+Goal crosshair colors (by kind):
+    pink         user click
+    blue         frontier (auto-explore picked)
+    yellow       sweep    (coverage picked)
 
 Controls:
-    Mouse left-click on map : set navigation goal
+    Mouse left-click on map : set navigation goal (kind = 'user')
     W / A / S / D           : manual drive override
     T                       : toggle autonomous frontier exploration
-    R                       : reset map
+    Y                       : toggle sweep / coverage
+    R                       : reset map AND coverage
     O                       : save map
     L                       : load map
     ESC                     : quit
@@ -27,23 +36,32 @@ import numpy as np
 import pygame
 
 
-CELL_PX = 6        # screen pixels per grid cell
-PANEL_W = 240      # right-hand info panel width
+CELL_PX = 6
+PANEL_W = 240
 BG_COLOR        = ( 30,  30,  30)
 COLOR_UNKNOWN   = ( 60,  60,  60)
 COLOR_FREE      = (220, 220, 220)
+COLOR_VISITED   = (170, 220, 185)   # mint = free + cleaned
 COLOR_OCCUPIED  = ( 20,  20,  20)
 COLOR_ROBOT     = ( 60, 200, 255)
 COLOR_HEADING   = (255, 230,   0)
 COLOR_RAY_HIT   = (255,  80,  80)
 COLOR_RAY_MISS  = (110, 110, 110)
 COLOR_PATH      = ( 40, 240, 120)
-COLOR_GOAL      = (255,  60, 200)
-COLOR_FRONTIER  = ( 90, 180, 255)
+COLOR_GOAL_USER     = (255,  60, 200)
+COLOR_GOAL_FRONTIER = ( 90, 180, 255)
+COLOR_GOAL_SWEEP    = (255, 220,  60)
 COLOR_TEXT      = (235, 235, 235)
 COLOR_WARN      = (255, 200,   0)
-COLOR_AUTO_ON   = ( 80, 250, 130)
-COLOR_AUTO_OFF  = (180, 180, 180)
+COLOR_BADGE_ON  = ( 80, 250, 130)
+COLOR_BADGE_OFF = (140, 140, 140)
+
+
+_GOAL_COLORS = {
+    "user":     COLOR_GOAL_USER,
+    "frontier": COLOR_GOAL_FRONTIER,
+    "sweep":    COLOR_GOAL_SWEEP,
+}
 
 
 class Visualizer:
@@ -59,10 +77,9 @@ class Visualizer:
         self.font_m = pygame.font.SysFont("Consolas", 17)
         self._panel_lines_extra: List[str] = []
         self._auto_explore_on = False
+        self._sweep_on = False
 
     # ===================== coordinate transforms =====================
-    # Cell (gx, gy) -> screen pixel (center of cell).
-    # We flip both axes so that +x is up and +y is left.
     def _cell_to_px(self, gx: int, gy: int) -> Tuple[int, int]:
         sx = (self.grid.size - 1 - gy) * CELL_PX + CELL_PX // 2
         sy = (self.grid.size - 1 - gx) * CELL_PX + CELL_PX // 2
@@ -73,7 +90,6 @@ class Visualizer:
         return self._cell_to_px(gx, gy)
 
     def _px_to_world(self, sx: int, sy: int) -> Tuple[float, float]:
-        # Inverse of _cell_to_px (treating cell-center pixels).
         gy = self.grid.size - 1 - (sx - CELL_PX // 2) / CELL_PX
         gx = self.grid.size - 1 - (sy - CELL_PX // 2) / CELL_PX
         x = (gx - self.grid.origin) * self.grid.resolution
@@ -90,6 +106,7 @@ class Visualizer:
             "click_world": None,
             "manual": (0, 0),
             "auto_toggle": False,
+            "sweep_toggle": False,
         }
         for ev in events:
             if ev.type == pygame.QUIT:
@@ -97,16 +114,16 @@ class Visualizer:
             elif ev.type == pygame.KEYDOWN:
                 if   ev.key == pygame.K_ESCAPE: state["quit"] = True
                 elif ev.key == pygame.K_r:      state["reset"] = True
-                elif ev.key == pygame.K_o:      state["save_map"] = True   # 'o' for sa(o)ve to avoid conflict with WASD
+                elif ev.key == pygame.K_o:      state["save_map"] = True
                 elif ev.key == pygame.K_l:      state["load_map"] = True
                 elif ev.key == pygame.K_t:      state["auto_toggle"] = True
-                elif ev.key == pygame.K_F5:     state["save_map"] = True   # backup binding
+                elif ev.key == pygame.K_y:      state["sweep_toggle"] = True
+                elif ev.key == pygame.K_F5:     state["save_map"] = True
             elif ev.type == pygame.MOUSEBUTTONDOWN and ev.button == 1:
                 if ev.pos[0] < self.map_px:
                     state["click_world"] = self._px_to_world(*ev.pos)
 
-        # Held-key manual drive (WASD).
-        # +turn = CCW (left) so A pressed -> +turn, D pressed -> -turn.
+        # Held-key manual drive (WASD). +turn = CCW (left).
         keys = pygame.key.get_pressed()
         fwd, turn = 0, 0
         if keys[pygame.K_w]: fwd  += 140
@@ -123,16 +140,20 @@ class Visualizer:
     def set_auto_explore(self, on: bool) -> None:
         self._auto_explore_on = bool(on)
 
+    def set_sweep(self, on: bool) -> None:
+        self._sweep_on = bool(on)
+
     # ===================== drawing =====================
-    def _draw_grid(self) -> None:
+    def _draw_grid(self, visited: Optional[np.ndarray]) -> None:
         occ = self.grid.occupancy()
         size = self.grid.size
-        # base[gx, gy] -> RGB
         base = np.full((size, size, 3), COLOR_UNKNOWN, dtype=np.uint8)
-        base[occ == 0] = COLOR_FREE
+        free_mask = (occ == 0)
+        base[free_mask] = COLOR_FREE
+        if visited is not None:
+            base[free_mask & visited] = COLOR_VISITED
         base[occ == 1] = COLOR_OCCUPIED
-        # Reorient so that screen pixel (sx, sy) maps to cell
-        # (gx, gy) = (size-1-sy, size-1-sx). See _cell_to_px.
+        # Reorient so screen pixel (sx, sy) maps to cell (size-1-sy, size-1-sx).
         screen_img = base[::-1, ::-1].transpose(1, 0, 2)
         surf = pygame.surfarray.make_surface(screen_img)
         surf = pygame.transform.scale(surf, (self.map_px, self.map_px))
@@ -155,7 +176,6 @@ class Visualizer:
         sx, sy = self._world_to_px(x, y)
         for ang, d in zip(sensor_angles, distances):
             if d is None or d < 0:
-                # missing reading - draw faint full-range ray to indicate sensor liveness
                 d_use = 2.5
                 color = (50, 50, 50)
             elif d > 2.5:
@@ -177,18 +197,19 @@ class Visualizer:
 
     def _draw_goal(self,
                    goal_world: Optional[Tuple[float, float]],
-                   auto_pick: bool = False) -> None:
+                   goal_kind: Optional[str]) -> None:
         if goal_world is None:
             return
+        color = _GOAL_COLORS.get(goal_kind or "user", COLOR_GOAL_USER)
         sx, sy = self._world_to_px(*goal_world)
-        color = COLOR_FRONTIER if auto_pick else COLOR_GOAL
         pygame.draw.circle(self.screen, color, (sx, sy), 7, 2)
         pygame.draw.line(self.screen, color, (sx - 9, sy), (sx + 9, sy), 1)
         pygame.draw.line(self.screen, color, (sx, sy - 9), (sx, sy + 9), 1)
 
     def _draw_panel(self,
                     pose: Optional[Tuple[float, float, float]],
-                    distances: Optional[Sequence[float]]) -> None:
+                    distances: Optional[Sequence[float]],
+                    visited: Optional[np.ndarray]) -> None:
         x0 = self.map_px + 12
         y  = 14
         pygame.draw.rect(self.screen, (45, 45, 45),
@@ -196,11 +217,15 @@ class Visualizer:
         title = self.font_m.render("VacBot SLAM", True, COLOR_TEXT)
         self.screen.blit(title, (x0, y)); y += 28
 
-        # Auto-explore badge
-        auto_color = COLOR_AUTO_ON if self._auto_explore_on else COLOR_AUTO_OFF
-        auto_label = "AUTO  ON " if self._auto_explore_on else "AUTO  off"
-        self.screen.blit(self.font_m.render(auto_label, True, auto_color),
-                         (x0, y)); y += 26
+        # Mode badges
+        c_auto  = COLOR_BADGE_ON if self._auto_explore_on else COLOR_BADGE_OFF
+        c_sweep = COLOR_BADGE_ON if self._sweep_on        else COLOR_BADGE_OFF
+        self.screen.blit(self.font_m.render(
+            "AUTO  " + ("ON " if self._auto_explore_on else "off"),
+            True, c_auto), (x0, y)); y += 22
+        self.screen.blit(self.font_m.render(
+            "SWEEP " + ("ON " if self._sweep_on        else "off"),
+            True, c_sweep), (x0, y)); y += 26
 
         if pose is None:
             self.screen.blit(self.font_s.render("No telemetry", True, COLOR_WARN),
@@ -220,18 +245,30 @@ class Visualizer:
                       else f"{name}:   --"
                 self.screen.blit(self.font_s.render(txt, True, COLOR_TEXT),
                                  (x0, y)); y += 18
-            y += 6
+            y += 4
+
+        # Coverage % readout
+        if visited is not None:
+            occ = self.grid.occupancy()
+            free_total = int((occ == 0).sum())
+            if free_total > 0:
+                covered = int(((occ == 0) & visited).sum())
+                pct = 100.0 * covered / free_total
+                self.screen.blit(self.font_s.render(
+                    f"coverage: {pct:5.1f}%  ({covered}/{free_total})",
+                    True, COLOR_TEXT), (x0, y)); y += 20
 
         for ln in self._panel_lines_extra:
             self.screen.blit(self.font_s.render(ln, True, COLOR_WARN),
                              (x0, y)); y += 18
 
-        y += 8
+        y += 6
         help_lines = [
             "----- controls -----",
             " mouse: set goal",
             " WASD : manual drive",
             " T    : toggle AUTO",
+            " Y    : toggle SWEEP",
             " R    : reset map",
             " O    : save map",
             " L    : load map",
@@ -248,15 +285,16 @@ class Visualizer:
              sensor_angles: Sequence[float],
              path: Optional[List[Tuple[int, int]]],
              goal_world: Optional[Tuple[float, float]],
-             goal_is_frontier: bool = False) -> None:
+             goal_kind: Optional[str] = None,
+             visited: Optional[np.ndarray] = None) -> None:
         self.screen.fill(BG_COLOR)
-        self._draw_grid()
+        self._draw_grid(visited)
         self._draw_path(path)
-        self._draw_goal(goal_world, auto_pick=goal_is_frontier)
+        self._draw_goal(goal_world, goal_kind)
         if pose is not None and distances is not None:
             self._draw_rays(pose, distances, sensor_angles)
             self._draw_robot(pose)
-        self._draw_panel(pose, distances)
+        self._draw_panel(pose, distances, visited)
         pygame.display.flip()
 
     def close(self) -> None:

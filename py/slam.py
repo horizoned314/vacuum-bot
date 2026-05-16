@@ -25,8 +25,8 @@ from typing import Iterable, List, Tuple
 import numpy as np
 
 
-GRID_SIZE = 100
-GRID_RES = 0.05      # meters / cell
+GRID_SIZE = 500
+GRID_RES = 0.1      # meters / cell
 MAX_RANGE = 2.5      # meters
 
 
